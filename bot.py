@@ -2110,7 +2110,7 @@ TELEGRAM_SERVICE_DEFAULTS = {
     "views": {"unit": 1000, "daily": 20000},
     "members": {"unit": 1000, "daily": 20000},
     "reactions": {"unit": 1000, "daily": 20000},
-    "bot_starts": {"unit": 1000, "daily": 0},
+    "bot_starts": {"unit": 500, "daily": 0},
     "comments": {"unit": 1000, "daily": 0},
 }
 
@@ -2450,11 +2450,12 @@ def tg_service_order_summary(state: dict) -> str:
     unit_rate, daily_rate = state["unit_rate"], state["daily_rate"]
     quantity, days = state["quantity"], state.get("days", 0)
     total = quantity * unit_rate + days * daily_rate
+    quantity_label = "تعداد استارت درخواستی" if service == "bot_starts" else "تعداد"
     parts = [
         "🧾 <b>خلاصهٔ سفارش خدمات تلگرامی</b>",
         f"خدمت: <b>{label}</b>",
         f"نوع سفارش: <b>{'گروهی' if state['mode'] == 'group' else 'تکی'}</b>",
-        f"تعداد: <b>{quantity:,}</b>",
+        f"{quantity_label}: <b>{quantity:,}</b>",
         f"لینک: {html.escape(state['target_url'])}",
     ]
     if days:
@@ -2521,7 +2522,7 @@ def tg_service_payment_text(order: dict) -> str:
         f"💳 <b>پرداخت سفارش خدمات تلگرامی #{order['id']}</b>\n\n"
         f"مبلغ قابل پرداخت: <b>{format_toman(order['price'])}</b>\n"
         f"خدمت: {TELEGRAM_SERVICE_LABELS[order['service_kind']]}\n"
-        f"تعداد: {order['quantity']:,}\n"
+        f"{'تعداد استارت درخواستی' if order['service_kind'] == 'bot_starts' else 'تعداد'}: {order['quantity']:,}\n"
         + (f"مدت: {order['duration_days']} روز\n" if order.get("duration_days") else "")
         + f"لینک: {html.escape(order['target_url'])}\n\n"
         "شماره کارت:\n"
@@ -2838,7 +2839,13 @@ async def on_tg_service_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
         state["mode"] = mode
         state["step"] = "quantity"
-        noun = "ممبر" if state["service"] == "members" else "واحد"
+        noun = {
+            "members": "ممبر",
+            "bot_starts": "استارت",
+            "comments": "کامنت",
+            "views": "ویو",
+            "reactions": "ری‌اکشن",
+        }[state["service"]]
         await _safe_edit(
             query,
             f"تعداد {noun} موردنیاز را به‌صورت عدد بفرستید (۱ تا {MAX_PURCHASE_MEMBERS:,}).",
@@ -3058,11 +3065,12 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def tg_service_admin_caption(order: dict) -> str:
     username = f" (@{html.escape(order.get('user_username') or '')})" if order.get("user_username") else ""
     mode = "گروهی" if order.get("mode") == "group" else "تکی"
+    quantity_label = "استارت درخواستی" if order.get("service_kind") == "bot_starts" else "تعداد"
     return (
         f"🧾 <b>فیش خدمات تلگرامی — سفارش #{order['id']}</b>\n\n"
         f'👤 <a href="tg://user?id={order["user_id"]}">{html.escape(order.get("user_name") or "کاربر")}</a>{username}\n'
         f"نوع خدمت: <b>{TELEGRAM_SERVICE_LABELS.get(order['service_kind'], 'نامشخص')}</b> ({mode})\n"
-        f"تعداد: <b>{int(order['quantity']):,}</b>\n"
+        f"{quantity_label}: <b>{int(order['quantity']):,}</b>\n"
         + (f"مدت: <b>{int(order.get('duration_days') or 0)} روز</b>\n" if order.get("duration_days") else "")
         + f"لینک هدف: {html.escape(order['target_url'])}\n"
         f"مبلغ: <b>{format_toman(int(order['price']))}</b>"
@@ -3213,12 +3221,19 @@ async def customer_private_message(update: Update, context: ContextTypes.DEFAULT
             tg_state["step"] = "target"
             if tg_state["mode"] == "group":
                 target_prompt = "لینک کانال را بفرستید."
+            elif tg_state["service"] == "bot_starts":
+                target_prompt = "لینک رفرال/دعوت ربات مقصد را بفرستید."
             elif tg_state["service"] in ("views", "reactions", "comments"):
                 target_prompt = "لینک پست تلگرام را بفرستید."
             else:
                 target_prompt = "لینک کانال یا ربات هدف را بفرستید."
             await message.reply_text(
-                target_prompt + "\nنمونه: <code>https://t.me/channel_name/123</code>",
+                target_prompt
+                + (
+                    "\nنمونه: <code>https://t.me/example_bot?start=ref123</code>"
+                    if tg_state["service"] == "bot_starts"
+                    else "\nنمونه: <code>https://t.me/channel_name/123</code>"
+                ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=back_kb("tgsvc_buy_home"),
             )
