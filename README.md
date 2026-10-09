@@ -8,9 +8,12 @@ pip install -r requirements.txt
 
 ## تنظیم اولیه
 
-1. فایل `bot.py` را باز کنید و مقادیر زیر را وارد کنید:
+1. متغیرهای محیطی سرویس را تنظیم کنید (توکن‌ها و کلیدها را داخل فایل کد قرار ندهید):
    - `BOT_TOKEN` → توکن ربات از @BotFather
-   - `OWNER_ID` → آیدی عددی خودتان (از @userinfobot بگیرید)
+   - `SUPABASE_URL` و `SUPABASE_KEY` → اطلاعات پروژهٔ Supabase
+   - `WEBHOOK_URL` (یا `RENDER_EXTERNAL_URL`) → نشانی عمومی سرویس
+   - `CARD_NUMBER` و `CARD_HOLDER` → اطلاعات پرداخت
+   - `ADMIN_IDS` → اختیاری؛ آیدی ادمین‌های اضافه، جداشده با کاما. دو ادمین فعلی در کد حفظ شده‌اند.
 2. ربات را اجرا کنید:
    ```bash
    python bot.py
@@ -41,7 +44,7 @@ pip install -r requirements.txt
 ## محدودیت‌های اعمال‌شده طبق درخواست
 
 - ربات فقط در یک گروه (تعیین‌شده توسط مالک) فعال است.
-- فقط مالک (`OWNER_ID`) به پنل مدیریت در پیوی دسترسی دارد.
+- فقط ادمین‌های تعریف‌شده در `ADMIN_IDS` به پنل مدیریت در پیوی دسترسی دارند.
 - کانال‌ها قابل افزودن/حذف هستند.
 - منشن کاربر در تمام پیام‌های هشدار/تایید اجباری و تضمین‌شده است.
 - پیام کاربر غیرعضو حذف و پیام هشدار جایگزین می‌شود؛ با تایید عضویت، همان پیام ادیت می‌شود.
@@ -125,7 +128,7 @@ alter table channels add column if not exists quota_done boolean not null defaul
 6. ربات فیش را همراه مشخصات سفارش برای همه‌ی ادمین‌ها می‌فرستد با دکمه‌های **✅ تایید و ورود به صف** / **❌ رد فیش**
 7. با تایید، کاربر پیام می‌گیرد و آیتم وارد **صف** می‌شود؛ جایگاه او اعلام می‌شود. هر وقت نوبتش شد (جوین اجباری فعال شد) و هر وقت تعرفه‌اش کامل شد، خودکار به کاربر اطلاع داده می‌شود.
 
-تنظیمات ثابت (بالای بخش «فروش» در `bot.py`): `PRICE_PER_MEMBER`، `UNLIMITED_PRICE`، `CARD_NUMBER`، `CARD_HOLDER`، `DEFAULT_QUEUE_SLOTS`.
+تعرفه‌های جوین اجباری و ظرفیت صف فعلی طبق تنظیمات فروش باقی می‌مانند. شماره کارت و نام دارنده از متغیرهای محیطی `CARD_NUMBER` و `CARD_HOLDER` خوانده می‌شوند.
 
 ### صف
 - هر آیتمِ خریداری‌شده با تایید ادمین در صف (`queued`) قرار می‌گیرد و تا نوبتش نرسیده جوین اجباری نیست.
@@ -159,3 +162,57 @@ create table if not exists orders (
     created_at timestamptz not null default now()
 );
 ```
+
+## خدمات تلگرامی
+
+از پنل خرید می‌توان سفارش **ویو، ممبر، ری‌اکشن، استارت ربات و کامنت** ثبت کرد. ویو، ممبر و ری‌اکشن حالت تکی و گروهی دارند؛ گروهی هزینه‌اش این‌طور محاسبه می‌شود:
+
+`تعداد × قیمت هر واحد + تعداد روز × هزینهٔ روزانه`
+
+تعرفه‌های اولیهٔ نمونه برای هر واحد ۱٬۰۰۰ تومان و هزینهٔ روزانه ۲۰٬۰۰۰ تومان است. مالک از پنل «خدمات تلگرامی و تعرفه‌ها» می‌تواند برای هر خدمت قیمت هر واحد و (برای خدمات گروهی) هزینهٔ روزانه را تغییر دهد. کاربر لینک هدف و تعداد را وارد می‌کند، خلاصه و مبلغ را می‌بیند، فیش را می‌فرستد و ادمین پرداخت را تایید یا رد می‌کند. تایید ادمین در این نسخه فقط تایید پرداخت است؛ اجرای سفارش با سشن‌ها خودکار نشده و باید توسط ادمین هماهنگ/انجام شود.
+
+### مهاجرت Supabase خدمات و سشن‌ها
+
+این SQL را یک‌بار در Supabase اجرا کنید:
+
+```sql
+create table if not exists telegram_service_orders (
+    id bigint generated always as identity primary key,
+    user_id bigint not null,
+    user_name text,
+    user_username text,
+    service_kind text not null,
+    mode text not null,
+    quantity bigint not null,
+    target_url text not null,
+    duration_days integer not null default 0,
+    unit_rate bigint not null,
+    daily_rate bigint not null default 0,
+    price bigint not null,
+    status text not null default 'awaiting_receipt',
+    receipt_file_id text,
+    receipt_type text,
+    created_at timestamptz not null default now(),
+    reviewed_at timestamptz
+);
+
+create table if not exists telegram_service_sessions (
+    id bigint generated always as identity primary key,
+    label text not null,
+    session_ciphertext text not null,
+    is_active boolean not null default true,
+    created_at timestamptz not null default now()
+);
+```
+
+### مدیریت سشن اکانت‌ها
+
+برای افزودن، فعال/غیرفعال‌کردن یا حذف سشن از پنل مالک → «مدیریت سشن اکانت‌ها» استفاده کنید. سشن یک دسترسی کامل به حساب تلگرام است: فقط حساب‌هایی را اضافه کنید که مالکشان هستید. پیام ورودی سشن بلافاصله حذف می‌شود و مقدار ذخیره‌شده با Fernet رمزگذاری می‌شود؛ مقدار رمزگشایی‌شده در پنل یا گزارش‌ها نشان داده نمی‌شود.
+
+پیش از افزودن سشن، یک‌بار کلید Fernet بسازید:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+مقدار خروجی را به‌عنوان متغیر محیطی محرمانهٔ `TELEGRAM_SESSION_ENCRYPTION_KEY` تنظیم کنید و آن را در چت یا مخزن کد قرار ندهید. اگر این کلید گم شود، سشن‌های ذخیره‌شده قابل رمزگشایی نیستند.

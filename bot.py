@@ -91,8 +91,10 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from aiohttp import web
+from cryptography.fernet import Fernet
 
 from supabase import create_client, Client, ClientOptions
 from postgrest import SyncPostgrestClient  # noqa: F401  (فقط برای وضوح وابستگی)
@@ -122,13 +124,17 @@ from telegram.ext import (
 # تنظیمات ثابت
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
-ADMIN_IDS = {601668306, 8977934490}
+ADMIN_IDS = {601668306, 8977934490} | {
+    int(value.strip())
+    for value in os.environ.get("ADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 
 DEFAULT_WARN_TEXT = "<b>کاربر {mention}\nبرای ارسال پیام باید در موارد زیر عضو شوید:</b>"
 DEFAULT_JOINED_TEXT = "<b>کاربر {mention} در همه‌ی موارد عضو شد ✅</b>"
@@ -1063,6 +1069,8 @@ MAIN_MENU = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🏠 تنظیم گروه", callback_data="menu_set_group", style="primary")],
         [InlineKeyboardButton("📋 مدیریت آیتم‌ها", callback_data="menu_channels", style="primary")],
+        [InlineKeyboardButton("🛍 خدمات تلگرامی و تعرفه‌ها", callback_data="menu_tg_services", style="primary")],
+        [InlineKeyboardButton("🔐 مدیریت سشن اکانت‌ها", callback_data="tgsvc_sessions", style="primary")],
         [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="menu_texts", style="primary")],
         [InlineKeyboardButton("⏱ زمان حذف پیام هشدار", callback_data="menu_delete_timer", style="primary")],
         [InlineKeyboardButton("🛒 ظرفیت هم‌زمان صف فروش", callback_data="menu_queue_slots", style="primary")],
@@ -1195,10 +1203,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not is_admin(user.id):
         BUY_STATE.pop(user.id, None)
+        TELEGRAM_SERVICE_STATE.pop(user.id, None)
         await show_buy_home(update)
         return
     PENDING_ITEM_QUOTA.pop(user.id, None)
     BUY_STATE.pop(user.id, None)
+    TELEGRAM_SERVICE_STATE.pop(user.id, None)
     await update.message.reply_text(
         "به پنل مدیریت ربات جوین اجباری خوش آمدید 👋",
         reply_markup=MAIN_MENU,
@@ -1217,6 +1227,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = query.data
     await query.answer()
     BUY_STATE.pop(user_id, None)
+    TELEGRAM_SERVICE_STATE.pop(user_id, None)
     if data != "menu_queue_slots":
         PENDING_QUEUE_SLOTS.discard(user_id)
 
@@ -1224,6 +1235,10 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         PENDING_ITEM_TIME.pop(user_id, None)
     if not data.startswith("ch_quota_"):
         PENDING_ITEM_QUOTA.pop(user_id, None)
+    if not data.startswith("tgsvc_price_edit_"):
+        PENDING_TGSVC_PRICE.pop(user_id, None)
+    if data != "tgsvc_session_add":
+        PENDING_TG_SESSION_ADD.discard(user_id)
 
     if data == "menu_main":
         await query.edit_message_text("پنل مدیریت:", reply_markup=MAIN_MENU)
@@ -1241,6 +1256,90 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data == "menu_channels":
         await query.edit_message_text("مدیریت آیتم‌های جوین اجباری:", reply_markup=CHANNELS_MENU)
+
+    elif data in ("menu_tg_services", "tgsvc_admin_prices"):
+        await render_tgsvc_admin_prices(query)
+
+    elif data.startswith("tgsvc_price_edit_"):
+        service = data[len("tgsvc_price_edit_"):]
+        if service not in TELEGRAM_SERVICE_LABELS:
+            await query.edit_message_text("نوع خدمت نامعتبر است.", reply_markup=back_kb("menu_tg_services"))
+            return
+        PENDING_TGSVC_PRICE[user_id] = service
+        current = await get_tg_service_prices(service)
+        await query.edit_message_text(
+            f"تعرفهٔ «{TELEGRAM_SERVICE_LABELS[service]}» را بفرستید.\n\n"
+            f"قیمت فعلی هر واحد: <b>{format_toman(current['unit'])}</b>\n"
+            + (
+                f"هزینهٔ روزانهٔ فعلی: <b>{format_toman(current['daily'])}</b>\n\n"
+                "قالب: <code>قیمت هر واحد, هزینهٔ روزانه</code>\n"
+                "مثال: <code>1000,20000</code>"
+                if service in TELEGRAM_GROUP_SERVICES
+                else "\nقالب: فقط قیمت هر واحد را به تومان بفرستید، مثلاً <code>1000</code>."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb("menu_tg_services"),
+        )
+
+    elif data == "tgsvc_sessions":
+        await render_tgsvc_sessions(query)
+
+    elif data == "tgsvc_session_add":
+        if not _get_session_cipher():
+            await query.edit_message_text(
+                "برای ذخیرهٔ امن سشن، ابتدا متغیر محیطی "
+                "<code>TELEGRAM_SESSION_ENCRYPTION_KEY</code> را در محیط اجرای ربات تنظیم کنید.\n\n"
+                "برای ساخت کلید: <code>python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb("tgsvc_sessions"),
+            )
+            return
+        PENDING_TG_SESSION_ADD.add(user_id)
+        await query.edit_message_text(
+            "سشن یک دسترسی کامل به اکانت تلگرام است. فقط سشن اکانتی را اضافه کنید که مالک آن هستید.\n"
+            "سشن را در قالب زیر بفرستید؛ پیام ورودی بلافاصله حذف می‌شود و مقدار سشن در دیتابیس رمزگذاری می‌شود:\n\n"
+            "<code>نام دلخواه | SESSION_STRING</code>\n\n"
+            "مقدار سشن در فهرست مدیریت نمایش داده نمی‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb("tgsvc_sessions"),
+        )
+
+    elif data.startswith("tgsvc_session_toggle_"):
+        session_id = int(data.rsplit("_", 1)[1])
+        row = await db_get_tg_session(session_id)
+        if not row:
+            await query.edit_message_text("این سشن پیدا نشد.", reply_markup=back_kb("tgsvc_sessions"))
+            return
+        err = await db_update_tg_session(session_id, {"is_active": not bool(row.get("is_active"))})
+        if err:
+            await query.edit_message_text("ذخیرهٔ تغییر وضعیت ناموفق بود.", reply_markup=back_kb("tgsvc_sessions"))
+            return
+        await render_tgsvc_sessions(query, notice="وضعیت سشن به‌روزرسانی شد ✅")
+
+    elif data.startswith("tgsvc_session_del_"):
+        session_id = int(data.rsplit("_", 1)[1])
+        row = await db_get_tg_session(session_id)
+        if not row:
+            await query.edit_message_text("این سشن پیدا نشد.", reply_markup=back_kb("tgsvc_sessions"))
+            return
+        await query.edit_message_text(
+            f"سشن «{html.escape(row['label'])}» برای همیشه حذف شود؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("بله، حذف شود", callback_data=f"tgsvc_session_confirmdel_{session_id}", style="danger"),
+                    InlineKeyboardButton("انصراف", callback_data="tgsvc_sessions"),
+                ]]
+            ),
+        )
+
+    elif data.startswith("tgsvc_session_confirmdel_"):
+        session_id = int(data.rsplit("_", 1)[1])
+        err = await db_delete_tg_session(session_id)
+        await render_tgsvc_sessions(
+            query,
+            notice="سشن حذف شد ✅" if not err else "حذف سشن ناموفق بود.",
+        )
 
     elif data == "ch_add":
         PENDING_ITEM_ADD.add(user_id)
@@ -1445,6 +1544,12 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data.startswith("ord_no_"):
         await admin_reject_order(query, context, int(data.rsplit("_", 1)[1]))
 
+    elif data.startswith("tgsvc_order_ok_"):
+        await admin_approve_tg_service_order(query, context, int(data.rsplit("_", 1)[1]))
+
+    elif data.startswith("tgsvc_order_no_"):
+        await admin_reject_tg_service_order(query, context, int(data.rsplit("_", 1)[1]))
+
     elif data == "menu_status":
         group_id = await get_group_id()
         items = await list_items()
@@ -1531,11 +1636,95 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     if update.effective_chat.type != Chat.PRIVATE:
         return
-    if not is_admin(user.id) or user.id in BUY_STATE:
+    if not is_admin(user.id) or user.id in BUY_STATE or user.id in TELEGRAM_SERVICE_STATE:
         await customer_private_message(update, context)  # مشتری (یا ادمینی که در حال تست /buy است)
         return
 
     user_id = user.id
+
+    if user_id in PENDING_TG_SESSION_ADD:
+        # پیام حاوی سشن را قبل از اعتبارسنجی و ذخیره حذف می‌کنیم تا در تاریخچهٔ گفتگو نماند.
+        try:
+            await message.delete()
+        except TelegramError as exc:
+            logger.warning("حذف پیام ورودی سشن ناموفق بود؛ مقدار سشن لاگ نمی‌شود: %s", exc)
+            PENDING_TG_SESSION_ADD.discard(user_id)
+            await context.bot.send_message(
+                user_id,
+                "به‌دلایل امنیتی سشن ذخیره نشد، چون نتوانستم پیام را حذف کنم. "
+                "پیام را دستی از گفتگو پاک کنید و دوباره تلاش کنید.",
+                reply_markup=back_kb("tgsvc_sessions"),
+            )
+            return
+        raw = (message.text or "").strip()
+        label, separator, session_value = raw.partition("|")
+        label, session_value = label.strip(), session_value.strip()
+        cipher = _get_session_cipher()
+        if not cipher:
+            PENDING_TG_SESSION_ADD.discard(user_id)
+            await context.bot.send_message(
+                user_id,
+                "کلید رمزگذاری در دسترس نیست؛ سشن ذخیره نشد.",
+                reply_markup=back_kb("tgsvc_sessions"),
+            )
+            return
+        if not separator or not label or len(label) > 80 or not session_value or len(session_value) > 8192:
+            await context.bot.send_message(
+                user_id,
+                "قالب نامعتبر بود؛ چیزی ذخیره نشد. دوباره بفرستید: <code>نام دلخواه | SESSION_STRING</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb("tgsvc_sessions"),
+            )
+            return
+        encrypted = cipher.encrypt(session_value.encode("utf-8")).decode("ascii")
+        created = await db_add_tg_session(label, encrypted)
+        if not created:
+            await context.bot.send_message(
+                user_id,
+                "ثبت سشن ناموفق بود. مطمئن شوید جدول telegram_service_sessions ساخته شده است.",
+                reply_markup=back_kb("tgsvc_sessions"),
+            )
+            return
+        PENDING_TG_SESSION_ADD.discard(user_id)
+        await context.bot.send_message(
+            user_id,
+            "سشن با رمزگذاری ذخیره شد ✅",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔐 بازگشت به مدیریت سشن‌ها", callback_data="tgsvc_sessions")]]
+            ),
+        )
+        return
+
+    if user_id in PENDING_TGSVC_PRICE:
+        service = PENDING_TGSVC_PRICE[user_id]
+        parsed = _parse_tg_price_input(message.text or "", service)
+        if parsed is None:
+            await message.reply_text(
+                "قیمت نامعتبر است. عدد صحیح غیرمنفی بفرستید؛ برای تعرفهٔ دوگانه قالب <code>قیمت هر واحد, هزینهٔ روزانه</code> است.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb("menu_tg_services"),
+            )
+            return
+        unit_price, daily_price = parsed
+        err = await set_setting(f"tgsvc_price_{service}_unit", str(unit_price))
+        if not err and service in TELEGRAM_GROUP_SERVICES:
+            err = await set_setting(f"tgsvc_price_{service}_daily", str(daily_price))
+        if err:
+            await message.reply_text(
+                "ذخیرهٔ تعرفه ناموفق بود؛ مطمئن شوید جدول settings در دسترس است.",
+                reply_markup=back_kb("menu_tg_services"),
+            )
+            return
+        PENDING_TGSVC_PRICE.pop(user_id, None)
+        await message.reply_text(
+            f"تعرفهٔ «{TELEGRAM_SERVICE_LABELS[service]}» ذخیره شد ✅\n"
+            f"هر واحد: {format_toman(unit_price)}"
+            + (f" • روزانه: {format_toman(daily_price)}" if service in TELEGRAM_GROUP_SERVICES else ""),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت به تعرفه‌ها", callback_data="menu_tg_services")]]
+            ),
+        )
+        return
 
     # حالت: تنظیم ظرفیت هم‌زمان صف
     if user_id in PENDING_QUEUE_SLOTS:
@@ -1890,8 +2079,8 @@ PRICE_PER_MEMBER = 500            # تومان به‌ازای هر ممبر (ه
 UNLIMITED_PRICE = 100_000         # تومان، ممبر نامحدود
 MIN_PURCHASE_MEMBERS = 1
 MAX_PURCHASE_MEMBERS = 1_000_000
-CARD_NUMBER = "5022-2915-4965-8621"
-CARD_HOLDER = "غفاری"
+CARD_NUMBER = os.environ.get("CARD_NUMBER", "").strip()
+CARD_HOLDER = os.environ.get("CARD_HOLDER", "").strip()
 QUICK_COUNT_OPTIONS = (50, 100, 200)
 
 DEFAULT_QUEUE_SLOTS = 1           # تعداد آیتم خریداری‌شده‌ی هم‌زمان در جوین اجباری (0 = بدون محدودیت)
@@ -1902,9 +2091,28 @@ ORDERS_MISSING_HINT = (
 )
 
 BUY_STATE: dict = {}              # user_id -> {"step": target|count|summary|receipt, "kind", "target", "count"}
+TELEGRAM_SERVICE_STATE: dict = {}
+PENDING_TGSVC_PRICE: dict = {}
+PENDING_TG_SESSION_ADD: set = set()
 PENDING_QUEUE_SLOTS: set = set()
 _queue_lock = asyncio.Lock()
 _queue_task: Optional[asyncio.Task] = None
+
+TELEGRAM_SERVICE_LABELS = {
+    "views": "ویو",
+    "members": "ممبر",
+    "reactions": "ری‌اکشن",
+    "bot_starts": "استارت ربات",
+    "comments": "کامنت",
+}
+TELEGRAM_GROUP_SERVICES = {"views", "members", "reactions"}
+TELEGRAM_SERVICE_DEFAULTS = {
+    "views": {"unit": 1000, "daily": 20000},
+    "members": {"unit": 1000, "daily": 20000},
+    "reactions": {"unit": 1000, "daily": 20000},
+    "bot_starts": {"unit": 1000, "daily": 0},
+    "comments": {"unit": 1000, "daily": 0},
+}
 
 
 def format_toman(amount: int) -> str:
@@ -1926,7 +2134,8 @@ def buy_home_text() -> str:
         f"• هر ممبر: {format_toman(PRICE_PER_MEMBER)}\n"
         f"• هر ۱۰۰ ممبر: {format_toman(PRICE_PER_MEMBER * 100)}\n"
         f"• ممبر نامحدود: {format_toman(UNLIMITED_PRICE)}\n\n"
-        "جوین اجباری را برای کدام مورد می‌خواهید؟"
+        "جوین اجباری را برای کدام مورد می‌خواهید؟\n\n"
+        "برای سفارش ویو، ممبر، ری‌اکشن، استارت ربات یا کامنت، بخش «خدمات تلگرامی» را انتخاب کنید."
     )
 
 
@@ -1936,6 +2145,7 @@ def buy_home_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📢 جوین اجباری برای کانال", callback_data="buy_kind_channel", style="primary")],
             [InlineKeyboardButton("👥 جوین اجباری برای گروه", callback_data="buy_kind_group", style="primary")],
             [InlineKeyboardButton("🤖 جوین اجباری برای ربات", callback_data="buy_kind_bot", style="primary")],
+            [InlineKeyboardButton("🛍 خدمات تلگرامی", callback_data="tgsvc_buy_home", style="success")],
         ]
     )
 
@@ -2032,6 +2242,353 @@ def parse_purchase_count(text: str) -> Optional[int]:
     if value != 0 and value < MIN_PURCHASE_MEMBERS:
         return None
     return value
+
+
+# ---- خدمات تلگرامی: تعرفه، سفارش و مدیریت امن سشن‌ها ----
+
+def _get_session_cipher():
+    key = os.environ.get("TELEGRAM_SESSION_ENCRYPTION_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeEncodeError):
+        logger.error("TELEGRAM_SESSION_ENCRYPTION_KEY قالب Fernet معتبر ندارد.")
+        return None
+
+
+async def get_tg_service_prices(service: str) -> dict:
+    defaults = TELEGRAM_SERVICE_DEFAULTS[service]
+    unit_raw, daily_raw = await asyncio.gather(
+        get_setting(f"tgsvc_price_{service}_unit"),
+        get_setting(f"tgsvc_price_{service}_daily"),
+    )
+    try:
+        unit = max(0, int(unit_raw)) if unit_raw is not None else defaults["unit"]
+    except (TypeError, ValueError):
+        unit = defaults["unit"]
+    try:
+        daily = max(0, int(daily_raw)) if daily_raw is not None else defaults["daily"]
+    except (TypeError, ValueError):
+        daily = defaults["daily"]
+    return {"unit": unit, "daily": daily}
+
+
+async def render_tgsvc_admin_prices(query, notice: str = "") -> None:
+    rows = []
+    for service, label in TELEGRAM_SERVICE_LABELS.items():
+        prices = await get_tg_service_prices(service)
+        line = f"• {label}: هر واحد {format_toman(prices['unit'])}"
+        if service in TELEGRAM_GROUP_SERVICES:
+            line += f" + روزانه {format_toman(prices['daily'])}"
+        rows.append(line)
+    keyboard = [
+        [InlineKeyboardButton(f"✏️ تغییر تعرفهٔ {label}", callback_data=f"tgsvc_price_edit_{service}")]
+        for service, label in TELEGRAM_SERVICE_LABELS.items()
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")])
+    text = (
+        (notice + "\n\n" if notice else "")
+        + "🛍 <b>تعرفهٔ خدمات تلگرامی</b>\n\n"
+        + "\n".join(rows)
+        + "\n\nبرای ویو، ممبر و ری‌اکشن سفارش تکی یا گروهی قابل انتخاب است. "
+        "قیمت گروهی = تعداد × قیمت هر واحد + تعداد روز × هزینهٔ روزانه."
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def db_list_tg_sessions() -> list:
+    def _run():
+        return (
+            supabase.table("telegram_service_sessions")
+            .select("id,label,is_active,created_at")
+            .order("id")
+            .execute()
+            .data
+            or []
+        )
+
+    return await asyncio.to_thread(_safe_db, _run, [])
+
+
+async def db_get_tg_session(session_id: int) -> Optional[dict]:
+    def _run():
+        result = (
+            supabase.table("telegram_service_sessions")
+            .select("id,label,is_active,created_at")
+            .eq("id", session_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_safe_db, _run, None)
+
+
+async def db_add_tg_session(label: str, encrypted_value: str) -> Optional[dict]:
+    def _run():
+        result = supabase.table("telegram_service_sessions").insert(
+            {"label": label, "session_ciphertext": encrypted_value, "is_active": True}
+        ).execute()
+        return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_safe_db, _run, None)
+
+
+async def db_update_tg_session(session_id: int, fields: dict) -> Optional[str]:
+    def _run():
+        result = (
+            supabase.table("telegram_service_sessions")
+            .update(fields)
+            .eq("id", session_id)
+            .execute()
+        )
+        return result.data
+
+    try:
+        rows = await asyncio.to_thread(_run)
+        return None if rows else "not_found"
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام تغییر وضعیت سشن: %s", exc)
+        return str(exc)
+
+
+async def db_delete_tg_session(session_id: int) -> Optional[str]:
+    def _run():
+        result = (
+            supabase.table("telegram_service_sessions")
+            .delete()
+            .eq("id", session_id)
+            .execute()
+        )
+        return result.data
+
+    try:
+        rows = await asyncio.to_thread(_run)
+        return None if rows else "not_found"
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام حذف سشن: %s", exc)
+        return str(exc)
+
+
+async def render_tgsvc_sessions(query, notice: str = "") -> None:
+    sessions = await db_list_tg_sessions()
+    text = (notice + "\n\n" if notice else "") + "🔐 <b>مدیریت سشن اکانت‌ها</b>\n\n"
+    rows = []
+    if sessions:
+        for item in sessions:
+            enabled = bool(item.get("is_active"))
+            text += f"• <b>{html.escape(item.get('label') or 'بدون نام')}</b> — {'فعال' if enabled else 'غیرفعال'}\n"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{'⏸ غیرفعال‌کردن' if enabled else '▶️ فعال‌کردن'}: {item.get('label', 'سشن')[:18]}",
+                        callback_data=f"tgsvc_session_toggle_{item['id']}",
+                    ),
+                    InlineKeyboardButton("🗑 حذف", callback_data=f"tgsvc_session_del_{item['id']}", style="danger"),
+                ]
+            )
+    else:
+        text += "هنوز سشنی ثبت نشده است.\n"
+    text += (
+        "\nسشن‌ها در دیتابیس رمزگذاری‌شده ذخیره می‌شوند و مقدارشان در پنل نمایش داده نمی‌شود. "
+        "برای کارکرد رمزگذاری، کلید محیطی TELEGRAM_SESSION_ENCRYPTION_KEY لازم است."
+    )
+    rows.append([InlineKeyboardButton("➕ افزودن سشن", callback_data="tgsvc_session_add", style="success")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")])
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def _parse_tg_price_input(text: str, service: str) -> Optional[tuple[int, int]]:
+    raw = (text or "").translate(_PERSIAN_DIGITS).strip().replace("٬", "").replace(" ", "")
+    parts = [part for part in re.split(r"[,،|/;\n]+", raw) if part]
+    expected = 2 if service in TELEGRAM_GROUP_SERVICES else 1
+    if len(parts) != expected or any(not part.isdigit() for part in parts):
+        return None
+    values = [int(part) for part in parts]
+    if any(value > 10_000_000_000 for value in values):
+        return None
+    return (values[0], values[1] if expected == 2 else 0)
+
+
+def _parse_tg_service_quantity(text: str) -> Optional[int]:
+    cleaned = (text or "").translate(_PERSIAN_DIGITS).strip().replace(",", "").replace("٬", "").replace(" ", "")
+    if not cleaned.isdigit():
+        return None
+    value = int(cleaned)
+    return value if 1 <= value <= MAX_PURCHASE_MEMBERS else None
+
+
+def _normalize_tme_link(text: str) -> Optional[str]:
+    value = (text or "").strip()
+    if len(value) > 512 or any(char.isspace() for char in value):
+        return None
+    if value.startswith("t.me/") or value.startswith("telegram.me/"):
+        value = "https://" + value
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or parsed.netloc.lower() not in ("t.me", "www.t.me", "telegram.me", "www.telegram.me"):
+        return None
+    if not parsed.path or parsed.path == "/":
+        return None
+    return value
+
+
+def tg_service_order_summary(state: dict) -> str:
+    service = state["service"]
+    label = TELEGRAM_SERVICE_LABELS[service]
+    unit_rate, daily_rate = state["unit_rate"], state["daily_rate"]
+    quantity, days = state["quantity"], state.get("days", 0)
+    total = quantity * unit_rate + days * daily_rate
+    parts = [
+        "🧾 <b>خلاصهٔ سفارش خدمات تلگرامی</b>",
+        f"خدمت: <b>{label}</b>",
+        f"نوع سفارش: <b>{'گروهی' if state['mode'] == 'group' else 'تکی'}</b>",
+        f"تعداد: <b>{quantity:,}</b>",
+        f"لینک: {html.escape(state['target_url'])}",
+    ]
+    if days:
+        parts.extend(
+            [
+                f"مدت: <b>{days} روز</b>",
+                f"{format_toman(daily_rate)} × {days} روز = {format_toman(daily_rate * days)}",
+            ]
+        )
+    parts.extend(
+        [
+            f"{format_toman(unit_rate)} × {quantity:,} = {format_toman(unit_rate * quantity)}",
+            f"\n💰 <b>مبلغ کل: {format_toman(total)}</b>",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def tg_service_summary_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ تایید و پرداخت", callback_data="tgsvc_buy_confirm", style="success")],
+            [InlineKeyboardButton("❌ لغو سفارش", callback_data="tgsvc_buy_cancel", style="danger")],
+        ]
+    )
+
+
+def tg_service_home_text() -> str:
+    return (
+        "🛍 <b>خدمات تلگرامی</b>\n\n"
+        "یکی از خدمات را انتخاب کنید:\n"
+        "برای ویو، ممبر و ری‌اکشن می‌توانید سفارش تکی یا گروهی ثبت کنید."
+    )
+
+
+def tg_service_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👁 ویو", callback_data="tgsvc_buy_kind_views", style="primary")],
+            [InlineKeyboardButton("👥 ممبر", callback_data="tgsvc_buy_kind_members", style="primary")],
+            [InlineKeyboardButton("❤️ ری‌اکشن", callback_data="tgsvc_buy_kind_reactions", style="primary")],
+            [InlineKeyboardButton("🤖 استارت ربات", callback_data="tgsvc_buy_kind_bot_starts", style="primary")],
+            [InlineKeyboardButton("💬 کامنت", callback_data="tgsvc_buy_kind_comments", style="primary")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="buy_home")],
+        ]
+    )
+
+
+def tg_service_mode_keyboard(service: str) -> InlineKeyboardMarkup:
+    rows = []
+    if service in TELEGRAM_GROUP_SERVICES:
+        rows.append([InlineKeyboardButton("👤 تکی", callback_data="tgsvc_buy_mode_single", style="primary")])
+        rows.append([InlineKeyboardButton("👥 گروهی", callback_data="tgsvc_buy_mode_group", style="primary")])
+    else:
+        rows.append([InlineKeyboardButton("ادامهٔ سفارش", callback_data="tgsvc_buy_mode_single", style="primary")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="tgsvc_buy_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tg_service_payment_text(order: dict) -> str:
+    card_number = CARD_NUMBER or "شماره کارت هنوز توسط مالک تنظیم نشده است"
+    card_holder = CARD_HOLDER or "نام دارندهٔ کارت تنظیم نشده است"
+    return (
+        f"💳 <b>پرداخت سفارش خدمات تلگرامی #{order['id']}</b>\n\n"
+        f"مبلغ قابل پرداخت: <b>{format_toman(order['price'])}</b>\n"
+        f"خدمت: {TELEGRAM_SERVICE_LABELS[order['service_kind']]}\n"
+        f"تعداد: {order['quantity']:,}\n"
+        + (f"مدت: {order['duration_days']} روز\n" if order.get("duration_days") else "")
+        + f"لینک: {html.escape(order['target_url'])}\n\n"
+        "شماره کارت:\n"
+        f"<code>{html.escape(card_number)}</code>\n"
+        f"به نام: <b>{html.escape(card_holder)}</b>\n\n"
+        "پس از واریز، عکس فیش را همین‌جا ارسال کنید. سفارش پس از بررسی ادمین تایید می‌شود."
+    )
+
+
+TG_SERVICE_ORDERS_HINT = (
+    "جدول telegram_service_orders در Supabase موجود نیست؛ SQL مهاجرت جدید را از README اجرا کنید."
+)
+
+
+async def db_create_tg_service_order(fields: dict) -> tuple[Optional[dict], Optional[str]]:
+    def _run():
+        result = supabase.table("telegram_service_orders").insert(fields).execute()
+        return result.data[0] if result.data else None
+
+    try:
+        return await asyncio.to_thread(_run), None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای ثبت سفارش خدمات تلگرامی: %s", exc)
+        return None, str(exc)
+
+
+async def db_latest_tg_service_order(user_id: int, status: str) -> Optional[dict]:
+    def _run():
+        result = (
+            supabase.table("telegram_service_orders")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("status", status)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_safe_db, _run, None)
+
+
+async def db_get_tg_service_order(order_id: int) -> Optional[dict]:
+    def _run():
+        result = (
+            supabase.table("telegram_service_orders")
+            .select("*")
+            .eq("id", order_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_safe_db, _run, None)
+
+
+async def db_update_tg_service_order(
+    order_id: int, fields: dict, only_status: Optional[str] = None
+) -> Optional[dict]:
+    def _run():
+        query = supabase.table("telegram_service_orders").update(fields).eq("id", order_id)
+        if only_status is not None:
+            query = query.eq("status", only_status)
+        result = query.execute()
+        return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_safe_db, _run, None)
 
 
 # ---- دیتابیس سفارش‌ها ----
@@ -2238,7 +2795,112 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != Chat.PRIVATE:
         return
     BUY_STATE.pop(update.effective_user.id, None)
+    TELEGRAM_SERVICE_STATE.pop(update.effective_user.id, None)
     await show_buy_home(update)
+
+
+async def on_tg_service_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+    await query.answer()
+    state = TELEGRAM_SERVICE_STATE.get(user.id)
+
+    if data == "tgsvc_buy_home":
+        TELEGRAM_SERVICE_STATE.pop(user.id, None)
+        await _safe_edit(query, tg_service_home_text(), tg_service_home_keyboard())
+        return
+
+    if data.startswith("tgsvc_buy_kind_"):
+        service = data[len("tgsvc_buy_kind_"):]
+        if service not in TELEGRAM_SERVICE_LABELS:
+            await _safe_edit(query, "نوع خدمت نامعتبر است.", tg_service_home_keyboard())
+            return
+        TELEGRAM_SERVICE_STATE[user.id] = {"service": service, "step": "mode"}
+        prices = await get_tg_service_prices(service)
+        rate_text = f"تعرفه: هر واحد {format_toman(prices['unit'])}"
+        if service in TELEGRAM_GROUP_SERVICES:
+            rate_text += f" • روزانه {format_toman(prices['daily'])}"
+        await _safe_edit(
+            query,
+            f"خدمت انتخاب‌شده: <b>{TELEGRAM_SERVICE_LABELS[service]}</b>\n{rate_text}\n\nنوع سفارش را انتخاب کنید:",
+            tg_service_mode_keyboard(service),
+        )
+        return
+
+    if data.startswith("tgsvc_buy_mode_"):
+        if not state or state.get("step") != "mode":
+            await _safe_edit(query, "مرحلهٔ سفارش منقضی شده است.", tg_service_home_keyboard())
+            return
+        mode = data.rsplit("_", 1)[1]
+        if mode not in ("single", "group") or (mode == "group" and state["service"] not in TELEGRAM_GROUP_SERVICES):
+            await _safe_edit(query, "این نوع سفارش برای خدمت انتخاب‌شده در دسترس نیست.", tg_service_home_keyboard())
+            return
+        state["mode"] = mode
+        state["step"] = "quantity"
+        noun = "ممبر" if state["service"] == "members" else "واحد"
+        await _safe_edit(
+            query,
+            f"تعداد {noun} موردنیاز را به‌صورت عدد بفرستید (۱ تا {MAX_PURCHASE_MEMBERS:,}).",
+            back_kb("tgsvc_buy_home"),
+        )
+        return
+
+    if data == "tgsvc_buy_confirm":
+        if not state or state.get("step") != "summary":
+            await _safe_edit(query, "سفارش آمادهٔ پرداخت نیست؛ دوباره از خدمات تلگرامی شروع کنید.", tg_service_home_keyboard())
+            return
+        if not CARD_NUMBER or not CARD_HOLDER:
+            await _safe_edit(
+                query,
+                "روش پرداخت هنوز توسط مالک تنظیم نشده است. لطفاً کمی بعد دوباره تلاش کنید.",
+                tg_service_home_keyboard(),
+            )
+            return
+        total = state["quantity"] * state["unit_rate"] + state.get("days", 0) * state["daily_rate"]
+        order, error = await db_create_tg_service_order(
+            {
+                "user_id": user.id,
+                "user_name": user.first_name or "",
+                "user_username": user.username or "",
+                "service_kind": state["service"],
+                "mode": state["mode"],
+                "quantity": state["quantity"],
+                "target_url": state["target_url"],
+                "duration_days": state.get("days", 0),
+                "unit_rate": state["unit_rate"],
+                "daily_rate": state["daily_rate"],
+                "price": total,
+                "status": "awaiting_receipt",
+            }
+        )
+        if order is None:
+            await _safe_edit(query, f"ثبت سفارش ناموفق بود.\n{html.escape(TG_SERVICE_ORDERS_HINT)}", tg_service_home_keyboard())
+            return
+        state["step"] = "receipt"
+        state["order_id"] = order["id"]
+        await _safe_edit(
+            query,
+            tg_service_payment_text(order),
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"tgsvc_buy_cancel_{order['id']}", style="danger")]]
+            ),
+        )
+        return
+
+    if data == "tgsvc_buy_cancel" or data.startswith("tgsvc_buy_cancel_"):
+        order_id = None
+        if data.startswith("tgsvc_buy_cancel_"):
+            try:
+                order_id = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                order_id = None
+        if order_id is not None:
+            order = await db_get_tg_service_order(order_id)
+            if order and int(order["user_id"]) == user.id:
+                await db_update_tg_service_order(order_id, {"status": "cancelled"}, only_status="awaiting_receipt")
+        TELEGRAM_SERVICE_STATE.pop(user.id, None)
+        await _safe_edit(query, tg_service_home_text(), tg_service_home_keyboard())
 
 
 async def on_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2250,6 +2912,7 @@ async def on_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "buy_home":
         BUY_STATE.pop(user.id, None)
+        TELEGRAM_SERVICE_STATE.pop(user.id, None)
         await _safe_edit(query, buy_home_text(), buy_home_keyboard())
 
     elif data.startswith("buy_kind_"):
@@ -2277,6 +2940,13 @@ async def on_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "buy_confirm":
         if not state or not state.get("target") or "count" not in state:
             await _safe_edit(query, "نشست شما منقضی شده. دوباره شروع کنید:\n\n" + buy_home_text(), buy_home_keyboard())
+            return
+        if not CARD_NUMBER or not CARD_HOLDER:
+            await _safe_edit(
+                query,
+                "روش پرداخت هنوز توسط مالک تنظیم نشده است. لطفاً کمی بعد دوباره تلاش کنید.",
+                buy_home_keyboard(),
+            )
             return
         target, count = state["target"], state["count"]
         await db_cancel_awaiting(user.id)  # سفارش پرداخت‌نشده‌ی قبلی باطل می‌شود
@@ -2385,10 +3055,220 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def tg_service_admin_caption(order: dict) -> str:
+    username = f" (@{html.escape(order.get('user_username') or '')})" if order.get("user_username") else ""
+    mode = "گروهی" if order.get("mode") == "group" else "تکی"
+    return (
+        f"🧾 <b>فیش خدمات تلگرامی — سفارش #{order['id']}</b>\n\n"
+        f'👤 <a href="tg://user?id={order["user_id"]}">{html.escape(order.get("user_name") or "کاربر")}</a>{username}\n'
+        f"نوع خدمت: <b>{TELEGRAM_SERVICE_LABELS.get(order['service_kind'], 'نامشخص')}</b> ({mode})\n"
+        f"تعداد: <b>{int(order['quantity']):,}</b>\n"
+        + (f"مدت: <b>{int(order.get('duration_days') or 0)} روز</b>\n" if order.get("duration_days") else "")
+        + f"لینک هدف: {html.escape(order['target_url'])}\n"
+        f"مبلغ: <b>{format_toman(int(order['price']))}</b>"
+    )
+
+
+async def _handle_tg_service_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.effective_message, update.effective_user
+    order = await db_latest_tg_service_order(user.id, "awaiting_receipt")
+    if order is None:
+        await message.reply_text("سفارش خدمات تلگرامیِ در انتظار فیش ندارید.")
+        return
+    if message.photo:
+        file_id, file_type = message.photo[-1].file_id, "photo"
+    elif message.document and (message.document.mime_type or "").startswith(("image/", "application/pdf")):
+        file_id, file_type = message.document.file_id, "document"
+    else:
+        await message.reply_text("فیش را به‌صورت عکس یا PDF ارسال کنید.")
+        return
+
+    updated = await db_update_tg_service_order(
+        order["id"],
+        {"status": "review", "receipt_file_id": file_id, "receipt_type": file_type},
+        only_status="awaiting_receipt",
+    )
+    if updated is None:
+        await message.reply_text("این سفارش قبلاً ثبت یا لغو شده است.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ تایید سفارش", callback_data=f"tgsvc_order_ok_{order['id']}", style="success"),
+            InlineKeyboardButton("❌ رد فیش", callback_data=f"tgsvc_order_no_{order['id']}", style="danger"),
+        ]]
+    )
+    caption = tg_service_admin_caption(order)
+    delivered = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            if file_type == "photo":
+                await context.bot.send_photo(
+                    admin_id, file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard
+                )
+            else:
+                await context.bot.send_document(
+                    admin_id, file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard
+                )
+            delivered += 1
+        except (Forbidden, BadRequest, TimedOut, NetworkError) as exc:
+            logger.warning("ارسال فیش خدمات تلگرامی به ادمین %s ناموفق بود: %s", admin_id, exc)
+    if not delivered:
+        await db_update_tg_service_order(
+            order["id"],
+            {"status": "awaiting_receipt", "receipt_file_id": None, "receipt_type": None},
+            only_status="review",
+        )
+        await message.reply_text("ارسال فیش به ادمین‌ها ناموفق بود؛ چند دقیقه بعد دوباره تلاش کنید.")
+        return
+
+    TELEGRAM_SERVICE_STATE.pop(user.id, None)
+    await message.reply_text(
+        f"✅ فیش سفارش خدمات تلگرامی #{order['id']} برای بررسی ادمین ارسال شد."
+    )
+
+
+async def admin_approve_tg_service_order(query, context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+    order = await db_get_tg_service_order(order_id)
+    if order is None or order.get("status") != "review":
+        await query.message.reply_text(f"سفارش خدمات #{order_id} قبلاً رسیدگی شده یا وجود ندارد.")
+        return
+    updated = await db_update_tg_service_order(
+        order_id, {"status": "approved", "reviewed_at": datetime.now(timezone.utc).isoformat()}, only_status="review"
+    )
+    if updated is None:
+        await query.message.reply_text(f"سفارش خدمات #{order_id} قبلاً رسیدگی شده است.")
+        return
+    try:
+        base = query.message.caption_html or ""
+        await query.edit_message_caption(
+            caption=f"{base}\n\n✅ <b>پرداخت تایید شد</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except BadRequest as exc:
+        logger.info("به‌روزرسانی پیام تایید خدمات ناموفق بود: %s", exc)
+    await _safe_send(
+        context.bot,
+        order["user_id"],
+        f"✅ پرداخت سفارش خدمات تلگرامی #{order_id} تایید شد.\n"
+        "برای هماهنگی انجام سفارش، ادمین نتیجه و زمان‌بندی را در همین گفتگو اطلاع می‌دهد.",
+    )
+
+
+async def admin_reject_tg_service_order(query, context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+    order = await db_get_tg_service_order(order_id)
+    if order is None or order.get("status") != "review":
+        await query.message.reply_text(f"سفارش خدمات #{order_id} قبلاً رسیدگی شده یا وجود ندارد.")
+        return
+    updated = await db_update_tg_service_order(
+        order_id,
+        {"status": "awaiting_receipt", "receipt_file_id": None, "receipt_type": None},
+        only_status="review",
+    )
+    if updated is None:
+        await query.message.reply_text(f"سفارش خدمات #{order_id} قبلاً رسیدگی شده است.")
+        return
+    try:
+        base = query.message.caption_html or ""
+        await query.edit_message_caption(
+            caption=f"{base}\n\n❌ <b>فیش رد شد؛ سفارش برای ارسال مجدد فیش باز است</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except BadRequest as exc:
+        logger.info("به‌روزرسانی پیام رد خدمات ناموفق بود: %s", exc)
+    await _safe_send(
+        context.bot,
+        order["user_id"],
+        f"❌ فیش سفارش خدمات تلگرامی #{order_id} تایید نشد.\n"
+        "اگر پرداخت کرده‌اید، فیش صحیح را دوباره ارسال کنید؛ در غیر این صورت سفارش را لغو کنید.",
+    )
+    TELEGRAM_SERVICE_STATE[int(order["user_id"])] = {"step": "receipt", "order_id": order_id}
+
+
 async def customer_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.effective_message, update.effective_user
     state = BUY_STATE.get(user.id)
+    tg_state = TELEGRAM_SERVICE_STATE.get(user.id)
     has_file = bool(message.photo) or message.document is not None
+
+    if tg_state:
+        if tg_state.get("step") == "receipt":
+            if has_file:
+                await _handle_tg_service_receipt(update, context)
+            else:
+                await message.reply_text("برای ادامه، عکس یا PDF فیش واریزی را ارسال کنید.")
+            return
+        if has_file:
+            await message.reply_text("ابتدا مراحل سفارش را با پیام متنی کامل کنید؛ هنوز زمان ارسال فیش نیست.")
+            return
+        if tg_state.get("step") == "quantity":
+            quantity = _parse_tg_service_quantity(message.text or "")
+            if quantity is None:
+                await message.reply_text(
+                    f"تعداد نامعتبر است. عددی بین ۱ تا {MAX_PURCHASE_MEMBERS:,} بفرستید."
+                )
+                return
+            tg_state["quantity"] = quantity
+            tg_state["step"] = "target"
+            if tg_state["mode"] == "group":
+                target_prompt = "لینک کانال را بفرستید."
+            elif tg_state["service"] in ("views", "reactions", "comments"):
+                target_prompt = "لینک پست تلگرام را بفرستید."
+            else:
+                target_prompt = "لینک کانال یا ربات هدف را بفرستید."
+            await message.reply_text(
+                target_prompt + "\nنمونه: <code>https://t.me/channel_name/123</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb("tgsvc_buy_home"),
+            )
+            return
+        if tg_state.get("step") == "target":
+            target_url = _normalize_tme_link(message.text or "")
+            if not target_url:
+                await message.reply_text(
+                    "لینک معتبر تلگرام بفرستید؛ مانند <code>https://t.me/channel_name/123</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            tg_state["target_url"] = target_url
+            if tg_state["mode"] == "group":
+                tg_state["step"] = "days"
+                await message.reply_text(
+                    "مدت سفارش را به تعداد روز بفرستید (مثلاً <code>10</code>).",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_kb("tgsvc_buy_home"),
+                )
+                return
+            prices = await get_tg_service_prices(tg_state["service"])
+            tg_state["unit_rate"], tg_state["daily_rate"] = prices["unit"], prices["daily"]
+            tg_state["step"] = "summary"
+            await message.reply_text(
+                tg_service_order_summary(tg_state),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=tg_service_summary_keyboard(),
+            )
+            return
+        if tg_state.get("step") == "days":
+            raw_days = (message.text or "").translate(_PERSIAN_DIGITS).strip().replace(",", "").replace("٬", "")
+            if not raw_days.isdigit() or not 1 <= int(raw_days) <= 3650:
+                await message.reply_text("تعداد روز نامعتبر است. عددی بین ۱ تا ۳۶۵۰ بفرستید.")
+                return
+            tg_state["days"] = int(raw_days)
+            prices = await get_tg_service_prices(tg_state["service"])
+            tg_state["unit_rate"], tg_state["daily_rate"] = prices["unit"], prices["daily"]
+            tg_state["step"] = "summary"
+            await message.reply_text(
+                tg_service_order_summary(tg_state),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=tg_service_summary_keyboard(),
+            )
+            return
+        if tg_state.get("step") == "summary":
+            await message.reply_text("برای ثبت سفارش، دکمهٔ «تایید و پرداخت» را در خلاصهٔ سفارش بزنید.")
+            return
 
     if state and state.get("step") == "target":
         target, error = await resolve_buy_target(context.bot, message, state["kind"])
@@ -2416,7 +3296,13 @@ async def customer_private_message(update: Update, context: ContextTypes.DEFAULT
         return
 
     if has_file:
-        await _handle_receipt(update, context)
+        # بعد از رد فیش، وضعیت سفارش در دیتابیس مرجع است؛ بنابراین حتی پس از ری‌استارت هم
+        # ارسال دوبارهٔ فیش به مسیر درست می‌رود.
+        pending_tg_service = await db_latest_tg_service_order(user.id, "awaiting_receipt")
+        if pending_tg_service:
+            await _handle_tg_service_receipt(update, context)
+        else:
+            await _handle_receipt(update, context)
         return
 
     await message.reply_text("برای خرید جوین اجباری /start را بزنید.")
@@ -2713,6 +3599,8 @@ async def _on_cleanup(app: web.Application) -> None:
 
 
 def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("متغیر محیطی BOT_TOKEN باید تنظیم شود.")
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند.")
     if not BASE_URL:
@@ -2743,8 +3631,9 @@ def main() -> None:
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     application.add_handler(CallbackQueryHandler(on_check_membership, pattern=r"^check_membership(_\d+)?$"))
+    application.add_handler(CallbackQueryHandler(on_tg_service_callback, pattern=r"^tgsvc_buy_"))
     application.add_handler(CallbackQueryHandler(on_buy_callback, pattern="^buy_"))
-    application.add_handler(CallbackQueryHandler(owner_panel_router, pattern="^(menu_|ch_|txt_|ord_)"))
+    application.add_handler(CallbackQueryHandler(owner_panel_router, pattern="^(menu_|ch_|txt_|ord_|tgsvc_)"))
 
     application.add_handler(
         MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, on_group_message)
