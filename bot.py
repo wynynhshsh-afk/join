@@ -158,7 +158,10 @@ def _safe_db(fn, default=None):
 # کش کوتاه‌مدت: هر پیام گروه قبلاً چندین تماس دیتابیس (گروه، آیتم‌ها، متن‌ها، ...) می‌زد و
 # تماس‌ها در ترد‌های محدود صف می‌کشیدند؛ همین باعث کندی حذف پیام‌ها در حالت هجوم پیام بود.
 # کش فقط نتیجه‌ی موفق را نگه می‌دارد و با هر تغییر ادمین بلافاصله پاک می‌شود.
-CACHE_TTL_SECONDS = 15.0
+# تنظیمات/آیتم‌ها به‌ندرت تغییر می‌کنند و هر تغییر ادمین هم خودش کش را پاک می‌کند،
+# پس TTL طولانی هیچ تاخیری در دیدنِ تغییرات ایجاد نمی‌کند؛ فقط تعداد رفت‌وبرگشت
+# به Supabase را در هجوم پیام کم می‌کند.
+CACHE_TTL_SECONDS = 90.0
 _db_cache: dict = {}
 
 
@@ -279,7 +282,12 @@ async def _fetch_items() -> list:
         return cached
 
     def _run():
-        res = supabase.table("channels").select("*").order("id").execute()
+        res = (
+            supabase.table("channels")
+            .select("id,kind,chat_id,title,invite_link,expires_at,start_members,member_limit,quota_done")
+            .order("id")
+            .execute()
+        )
         items = res.data or []
         _cache_put("items", items)
         return items
@@ -388,7 +396,7 @@ MEMBER_LIMIT_MISSING_HINT = (
     "alter table channels add column if not exists quota_done boolean not null default false;"
 )
 MAX_MEMBER_LIMIT = 100_000_000
-QUOTA_CHECK_INTERVAL_SECONDS = 3.0   # حداقل فاصله‌ی بین دو دور بررسی تعرفه‌ها (برای جلوگیری از فشار روی API تلگرام)
+QUOTA_CHECK_INTERVAL_SECONDS = 10.0  # حداقل فاصله‌ی بین دو دور بررسی تعرفه‌ها (برای جلوگیری از فشار روی API تلگرام)
 
 _quota_bot = None                    # در شروع برنامه مقدار می‌گیرد (برای شمارش اعضا از داخل list_items)
 _quota_lock = asyncio.Lock()
@@ -642,8 +650,8 @@ async def get_missing_items(bot, user_id: int, items: Optional[list] = None) -> 
     return [it for it, ok in zip(items, results) if not ok]
 
 
-MEMBERSHIP_OK_TTL_SECONDS = 20.0    # کاربری که همه‌چیز را کامل دارد: ۲۰ ثانیه دوباره چک نمی‌شود
-MEMBERSHIP_MISS_TTL_SECONDS = 3.0   # کاربر ناقص: فقط برای هجوم پیام‌های هم‌زمان (چند ثانیه) کش می‌شود
+MEMBERSHIP_OK_TTL_SECONDS = 180.0   # کاربری که همه‌چیز را کامل دارد: ۳ دقیقه دوباره چک نمی‌شود
+MEMBERSHIP_MISS_TTL_SECONDS = 8.0   # کاربر ناقص: فقط برای هجوم پیام‌های هم‌زمان کش می‌شود
 _membership_cache: dict = {}        # user_id -> (زمان، مجموعه‌ی id آیتم‌های ناقص)
 _membership_inflight: dict = {}     # user_id -> تسک در حال اجرای بررسی
 
@@ -770,7 +778,7 @@ async def delete_message_reliably(message, attempts: int = 5) -> bool:
 
 
 ANONYMOUS_ADMIN_BOT_ID = 1087968824       # GroupAnonymousBot: پیام ادمینِ ناشناس
-GROUP_STAFF_TTL_SECONDS = 120.0
+GROUP_STAFF_TTL_SECONDS = 1200.0
 _group_staff_cache: dict = {}             # user_id -> (زمان، ادمین/مالک گروه است؟)
 _bot_warned_users: set = set()            # کاربرانی که فقط آیتم «ربات» برایشان مانده و هشدار گرفته‌اند
 
@@ -828,8 +836,10 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _membership_cache.pop(user.id, None)
         return
 
-    # اول حذف (هر پیام مستقل و هم‌زمان با بقیه‌ی پیام‌های همان کاربر)، بعد هشدار
-    await delete_message_reliably(message)
+    # حذف پیام و ارسال هشدار به هم وابسته نیستند؛ هم‌زمان اجرا می‌شوند تا هشدار
+    # منتظر تمام‌شدنِ حذف نماند (یک رفت‌وبرگشتِ شبکه کمتر تا دیدنِ هشدار توسط کاربر).
+    delete_task = asyncio.create_task(delete_message_reliably(message))
+    delete_task.add_done_callback(_log_task_exception)
 
     delay = await get_warn_delete_seconds()
 
@@ -958,11 +968,18 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         real_items = [it for it in items if it.get("kind") != "bot"]
         bot_items = [it for it in items if it.get("kind") == "bot"]
 
-        # کانال/گروه‌ها کامل شد → ورود به ربات‌ها هم خودکار تایید می‌شود (بررسی واقعی برای ربات ممکن نیست)
-        if not await get_missing_items(context.bot, user.id, real_items) and bot_items:
-            await asyncio.gather(*[record_bot_start(it["chat_id"], user.id) for it in bot_items])
+        # هر آیتم واقعی فقط یک‌بار به تلگرام چک می‌شود (نه دوبار)؛ نتیجه برای هر دو تصمیم
+        # (تایید خودکار ربات‌ها و ساخت لیست نهایی) از همین یک درخواست استفاده می‌شود.
+        missing_real = await get_missing_items(context.bot, user.id, real_items)
+        missing_bot: list = []
+        if bot_items:
+            if not missing_real:
+                # کانال/گروه‌ها کامل شد → ورود به ربات‌ها هم خودکار تایید می‌شود (بررسی واقعی برای ربات ممکن نیست)
+                await asyncio.gather(*[record_bot_start(it["chat_id"], user.id) for it in bot_items])
+            else:
+                missing_bot = await get_missing_items(context.bot, user.id, bot_items)
 
-        missing = await get_missing_items(context.bot, user.id, items)
+        missing = missing_real + missing_bot
         store_membership(user.id, missing)
 
         active = _active_warn.get(user.id)
@@ -1085,7 +1102,7 @@ def back_kb(callback_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback_data)]])
 
 
-MEMBER_COUNT_TTL_SECONDS = 60.0
+MEMBER_COUNT_TTL_SECONDS = 45.0
 _member_count_cache: dict = {}  # chat_id -> (زمان، تعداد)
 
 
@@ -1133,8 +1150,8 @@ async def fetch_member_count(bot, item: dict, force: bool = False) -> Optional[i
     return max(0, current - baseline)
 
 
-async def fetch_member_counts(bot, items: list) -> dict:
-    counts = await asyncio.gather(*(fetch_member_count(bot, it) for it in items))
+async def fetch_member_counts(bot, items: list, force: bool = False) -> dict:
+    counts = await asyncio.gather(*(fetch_member_count(bot, it, force=force) for it in items))
     return {it["id"]: c for it, c in zip(items, counts)}
 
 
@@ -1253,7 +1270,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not items:
             await query.edit_message_text("هیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
         else:
-            counts = await fetch_member_counts(context.bot, items)
+            counts = await fetch_member_counts(context.bot, items, force=True)
             await query.edit_message_text("یکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items, counts))
 
     elif data.startswith("ch_view_"):
@@ -1269,7 +1286,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"لینک: {item['invite_link']}\n"
                 f"وضعیت: {describe_item_schedule(item)}"
             )
-            count = await fetch_member_count(context.bot, item)
+            count = await fetch_member_count(context.bot, item, force=True)
             text += f"\nتعرفه‌ی ممبر: {format_quota(item, count)}"
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item, count))
 
@@ -1351,7 +1368,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         items = await list_all_items()
         msg = "حذف شد ✅" if removed else "حذف نشد، دوباره تلاش کنید."
         if items:
-            counts = await fetch_member_counts(context.bot, items)
+            counts = await fetch_member_counts(context.bot, items, force=True)
             await query.edit_message_text(f"{msg}\n\nیکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items, counts))
         else:
             await query.edit_message_text(f"{msg}\n\nهیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
@@ -1871,7 +1888,7 @@ async def _on_startup(app: web.Application) -> None:
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
         allowed_updates=Update.ALL_TYPES,
-        max_connections=100,
+        max_connections=40,
         drop_pending_updates=False,
     )
     logger.info("وبهوک روی %s تنظیم شد", webhook_url)
