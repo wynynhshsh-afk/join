@@ -414,7 +414,8 @@ def item_member_limit(item: dict) -> int:
 def format_quota(item: dict, joined: Optional[int]) -> str:
     limit = item_member_limit(item)
     if limit <= 0:
-        return "نامحدود"
+        # نامحدود: تعداد ورودی‌ها همچنان نمایش داده می‌شود
+        return f"{format_count(joined)} / نامحدود"
     return f"{format_count(joined)} / {limit:,}"
 
 
